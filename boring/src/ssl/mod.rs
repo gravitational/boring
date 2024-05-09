@@ -62,6 +62,7 @@ use foreign_types::{ForeignType, ForeignTypeRef, Opaque};
 use libc::{c_char, c_int, c_long, c_uchar, c_uint, c_void};
 use once_cell::sync::Lazy;
 use std::any::TypeId;
+use std::cmp;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
@@ -114,6 +115,9 @@ mod error;
 mod mut_only;
 #[cfg(test)]
 mod test;
+
+#[cfg(all(feature = "kx-safe-default", feature = "fips"))]
+compile_error!("The features 'kx-safe-default' and 'fips' cannot be enabled at the same time.");
 
 bitflags! {
     /// Options controlling the behavior of an `SslContext`.
@@ -1338,6 +1342,30 @@ impl SslContextBuilder {
         }
     }
 
+    /// Sets the list of supported ciphers for protocols before TLSv1.3.
+    ///
+    /// The `set_ciphersuites` method controls the cipher suites for TLSv1.3 in OpenSSL.
+    /// BoringSSL doesn't implement `set_ciphersuites`.
+    /// See https://github.com/google/boringssl/blob/master/include/openssl/ssl.h#L1542-L1544
+    ///
+    /// See [`ciphers`] for details on the format.
+    ///
+    /// This corresponds to [`SSL_CTX_set_strict_cipher_list`].
+    ///
+    /// [`ciphers`]: https://www.openssl.org/docs/man1.1.0/apps/ciphers.html
+    /// [`SSL_CTX_set_strict_cipher_list`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_CTX_set_strict_cipher_list
+    pub fn set_strict_cipher_list(&mut self, cipher_list: &str) -> Result<(), ErrorStack> {
+        let cipher_list = CString::new(cipher_list).unwrap();
+        unsafe {
+            let result = ffi::SSL_CTX_set_strict_cipher_list(self.as_ptr(), cipher_list.as_ptr());
+            if result == 1 {
+                Ok(())
+            } else {
+                Err(ErrorStack::get())
+            }
+        }
+    }
+
     /// Gets the list of supported ciphers for protocols before TLSv1.3.
     ///
     /// See [`ciphers`] for details on the format
@@ -1867,6 +1895,27 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_enabled(self.as_ptr(), enabled as _) }
     }
 
+    /// Sets the signing algorithm preferences for the SSL context.
+    ///
+    /// This function configures the SSL context to use the specified preferences
+    /// when signing with the context's private key. It returns `Ok(())` on success
+    /// and an error on failure. The preferences should not include the internal-only
+    /// value `SSL_SIGN_RSA_PKCS1_MD5_SHA1`.
+    ///
+    /// This corresponds to the C function [`SSL_CTX_set_signing_algorithm_prefs`].
+    ///
+    /// [`SSL_CTX_set_signing_algorithm_prefs`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_CTX_set_signing_algorithm_prefs
+    pub fn set_signing_algorithm_prefs(&mut self, prefs: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set_signing_algorithm_prefs(
+                self.as_ptr(),
+                prefs.as_ptr(),
+                prefs.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Sets the context's supported signature verification algorithms.
     ///
     /// This corresponds to [`SSL_CTX_set_verify_algorithm_prefs`]
@@ -1934,6 +1983,77 @@ impl SslContextBuilder {
     #[cfg(not(feature = "fips"))]
     pub fn set_compliance_policy(&mut self, policy: CompliancePolicy) -> Result<(), ErrorStack> {
         unsafe { cvt_0i(ffi::SSL_CTX_set_compliance_policy(self.as_ptr(), policy.0)).map(|_| ()) }
+    }
+
+    /// Sets the list of supported curves to an exclusive set that achieves FIPS compliance.
+    ///
+    /// Corresponds to [`SSL_CTX_set_compliance_policy()`] in more recent versions of boringssl
+    /// which contain that API.
+    ///
+    /// The key difference between this function and the aforementioned API is that compliance
+    /// policy  is that this function sets the minimum and maximum protocol versions to TLS 1.2,
+    /// whereas the aforementioned API sets the minimum to TLS 1.2 and the maximum to TLS 1.3.
+    ///
+    /// See [`SSL_CTX_set_compliance_policy()`] and [`fips202205::Configure`] for comparison.
+    ///
+    /// [`SSL_CTX_set_compliance_policy()`]: https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3385-L3395
+    /// [`fips202205::Configure`]: https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3300-L3321
+    #[cfg(any(feature = "fips", feature = "fips-link-precompiled"))]
+    pub fn set_fips_compliance_policy(&mut self) -> Result<(), ErrorStack> {
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3304-L3310
+        //
+        // We force TLS 1.2 because the [mechanism] for constraining TLS 1.3 used by `SSL_CTX_set_compliance_policy`
+        // is not available in the certified version of BoringSSL. There may yet be a way to do this in the version
+        // we're using, but it's not readily apparent.
+        //
+        // [mechanism]: https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3301
+        self.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        self.set_max_proto_version(Some(SslVersion::TLS1_2))?;
+
+        // There's no corresponding piece of `SSL_CTX_set_compliance_policy` for this, but it's used as
+        // further insurance that only TLS 1.2 is used.
+        let mut opts = self.options();
+        opts |= SslOptions::NO_SSLV2
+            | SslOptions::NO_SSLV3
+            | SslOptions::NO_TLSV1
+            | SslOptions::NO_TLSV1_1
+            | SslOptions::NO_TLSV1_3;
+        self.set_options(opts);
+
+        //https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3311-L3315
+        self.set_strict_cipher_list(
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:\
+            TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:\
+            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:\
+            TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        )?;
+
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3316
+        //
+        // We use `SSL_CTX_set1_curves` rather than `SSL_CTX_set1_group_ids` because the latter
+        // function is not available in the certified version of BoringSSL.
+        self.set_curves(&[SslCurve::SECP256R1, SslCurve::SECP384R1])?;
+
+        let k_sig_algs = &[
+            SslSignatureAlgorithm::RSA_PKCS1_SHA256,
+            SslSignatureAlgorithm::RSA_PKCS1_SHA384,
+            SslSignatureAlgorithm::RSA_PKCS1_SHA512,
+            SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256,
+            SslSignatureAlgorithm::ECDSA_SECP384R1_SHA384,
+            SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256,
+            SslSignatureAlgorithm::RSA_PSS_RSAE_SHA384,
+            SslSignatureAlgorithm::RSA_PSS_RSAE_SHA512,
+        ];
+
+        let k_sig_algs_u16: Vec<u16> = k_sig_algs.iter().map(|alg| alg.0).collect();
+
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3317-L3318
+        self.set_signing_algorithm_prefs(&k_sig_algs_u16)?;
+
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3319-L3320
+        self.set_verify_algorithm_prefs(k_sig_algs)?;
+
+        Ok(())
     }
 
     /// Consumes the builder, returning a new `SslContext`.

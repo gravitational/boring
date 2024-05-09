@@ -1004,6 +1004,30 @@ fn test_set_compliance() {
 }
 
 #[test]
+#[cfg(any(feature = "fips", feature = "fips-link-precompiled"))]
+fn test_client_set_fips_compliance_policy() {
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_fips_compliance_policy().unwrap();
+
+    assert_eq!(ctx.max_proto_version().unwrap(), SslVersion::TLS1_2);
+    assert_eq!(ctx.min_proto_version().unwrap(), SslVersion::TLS1_2);
+
+    const FIPS_CIPHERS: [&str; 4] = [
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-AES128-GCM-SHA256",
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+    ];
+
+    let ciphers = ctx.ciphers().unwrap();
+    assert_eq!(ciphers.len(), FIPS_CIPHERS.len());
+
+    for cipher in ciphers.into_iter().zip(FIPS_CIPHERS) {
+        assert_eq!(cipher.0.name(), cipher.1)
+    }
+}
+
+#[test]
 fn drop_ex_data_in_context() {
     let index = SslContext::new_ex_index::<&'static str>().unwrap();
     let mut ctx = SslContext::builder(SslMethod::dtls()).unwrap();
