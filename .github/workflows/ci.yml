@@ -248,14 +248,19 @@ jobs:
       shell: bash
     - name: Install Ninja
       uses: seanmiddleditch/gha-setup-ninja@v4
-    - name: Install Clang-14
+    - name: Install Clang-12
       uses: KyleMayes/install-llvm-action@v1
       with:
-        version: "14.0"
+        version: "12.0"
         directory: ${{ runner.temp }}/llvm
-    - name: Add clang++-14 link
+    - name: Install golang
+      uses: actions/checkout@v4
+      uses: actions/setup-go@v5
+      with:
+        go-version: '>=1.22.0'
+    - name: Add clang++-12 link
       working-directory: ${{ runner.temp }}/llvm/bin
-      run: ln -s clang clang++-14
+      run: ln -s clang clang++-12
     - name: Run tests
       run: cargo test --features fips
     - name: Test boring-sys cargo publish (FIPS)
@@ -311,14 +316,14 @@ jobs:
       shell: bash
     - name: Install Ninja
       uses: seanmiddleditch/gha-setup-ninja@v4
-    - name: Install Clang-14
+    - name: Install Clang-12
       uses: KyleMayes/install-llvm-action@v1
       with:
-        version: "14.0"
+        version: "12.0"
         directory: ${{ runner.temp }}/llvm
-    - name: Add clang++-14 link
+    - name: Add clang++-12 link
       working-directory: ${{ runner.temp }}/llvm/bin
-      run: ln -s clang clang++-14
+      run: ln -s clang clang++-12
     - name: Install ${{ matrix.target }} toolchain
       run: brew tap messense/macos-cross-toolchains && brew install ${{ matrix.target }}
     - name: Set BORING_BSSL_FIPS_COMPILER_EXTERNAL_TOOLCHAIN
