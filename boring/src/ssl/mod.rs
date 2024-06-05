@@ -70,7 +70,7 @@ use std::fmt;
 use std::io;
 use std::io::prelude::*;
 use std::marker::PhantomData;
-use std::mem::{self, ManuallyDrop};
+use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 use std::panic::resume_unwind;
 use std::path::Path;
@@ -115,6 +115,9 @@ mod error;
 mod mut_only;
 #[cfg(test)]
 mod test;
+
+#[cfg(all(feature = "kx-safe-default", feature = "fips"))]
+compile_error!("The features 'kx-safe-default' and 'fips' cannot be enabled at the same time.");
 
 bitflags! {
     /// Options controlling the behavior of an `SslContext`.
@@ -671,12 +674,10 @@ impl SslSignatureAlgorithm {
 }
 
 /// A TLS Curve.
-#[cfg(not(feature = "kx-safe-default"))]
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct SslCurve(c_int);
 
-#[cfg(not(feature = "kx-safe-default"))]
 impl SslCurve {
     pub const SECP224R1: SslCurve = SslCurve(ffi::NID_secp224r1);
 
@@ -699,6 +700,43 @@ impl SslCurve {
 
     #[cfg(feature = "pq-experimental")]
     pub const P256_KYBER768_DRAFT00: SslCurve = SslCurve(ffi::NID_P256Kyber768Draft00);
+
+    /// Returns the curve name
+    ///
+    /// This corresponds to [`SSL_get_curve_name`]
+    ///
+    /// [`SSL_get_curve_name`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_get_curve_name
+    pub fn name(&self) -> Option<&'static str> {
+        unsafe {
+            let ptr = ffi::SSL_get_curve_name(self.0 as u16);
+            if ptr.is_null() {
+                return None;
+            }
+
+            CStr::from_ptr(ptr).to_str().ok()
+        }
+    }
+}
+
+/// A compliance policy.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg(not(feature = "fips"))]
+pub struct CompliancePolicy(ffi::ssl_compliance_policy_t);
+
+#[cfg(not(feature = "fips"))]
+impl CompliancePolicy {
+    /// Does nothing, however setting this does not undo other policies, so trying to set this is an error.
+    pub const NONE: Self = Self(ffi::ssl_compliance_policy_t::ssl_compliance_policy_none);
+
+    /// Configures a TLS connection to try and be compliant with NIST requirements, but does not guarantee success.
+    /// This policy can be called even if Boring is not built with FIPS.
+    pub const FIPS_202205: Self =
+        Self(ffi::ssl_compliance_policy_t::ssl_compliance_policy_fips_202205);
+
+    /// Partially configures a TLS connection to be compliant with WPA3. Callers must enforce certificate chain requirements themselves.
+    /// Use of this policy is less secure than the default and not recommended.
+    pub const WPA3_192_202304: Self =
+        Self(ffi::ssl_compliance_policy_t::ssl_compliance_policy_wpa3_192_202304);
 }
 
 /// A compliance policy.
@@ -1304,6 +1342,30 @@ impl SslContextBuilder {
         }
     }
 
+    /// Sets the list of supported ciphers for protocols before TLSv1.3.
+    ///
+    /// The `set_ciphersuites` method controls the cipher suites for TLSv1.3 in OpenSSL.
+    /// BoringSSL doesn't implement `set_ciphersuites`.
+    /// See https://github.com/google/boringssl/blob/master/include/openssl/ssl.h#L1542-L1544
+    ///
+    /// See [`ciphers`] for details on the format.
+    ///
+    /// This corresponds to [`SSL_CTX_set_strict_cipher_list`].
+    ///
+    /// [`ciphers`]: https://www.openssl.org/docs/man1.1.0/apps/ciphers.html
+    /// [`SSL_CTX_set_strict_cipher_list`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_CTX_set_strict_cipher_list
+    pub fn set_strict_cipher_list(&mut self, cipher_list: &str) -> Result<(), ErrorStack> {
+        let cipher_list = CString::new(cipher_list).unwrap();
+        unsafe {
+            let result = ffi::SSL_CTX_set_strict_cipher_list(self.as_ptr(), cipher_list.as_ptr());
+            if result == 1 {
+                Ok(())
+            } else {
+                Err(ErrorStack::get())
+            }
+        }
+    }
+
     /// Gets the list of supported ciphers for protocols before TLSv1.3.
     ///
     /// See [`ciphers`] for details on the format
@@ -1833,6 +1895,27 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_enabled(self.as_ptr(), enabled as _) }
     }
 
+    /// Sets the signing algorithm preferences for the SSL context.
+    ///
+    /// This function configures the SSL context to use the specified preferences
+    /// when signing with the context's private key. It returns `Ok(())` on success
+    /// and an error on failure. The preferences should not include the internal-only
+    /// value `SSL_SIGN_RSA_PKCS1_MD5_SHA1`.
+    ///
+    /// This corresponds to the C function [`SSL_CTX_set_signing_algorithm_prefs`].
+    ///
+    /// [`SSL_CTX_set_signing_algorithm_prefs`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_CTX_set_signing_algorithm_prefs
+    pub fn set_signing_algorithm_prefs(&mut self, prefs: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_CTX_set_signing_algorithm_prefs(
+                self.as_ptr(),
+                prefs.as_ptr(),
+                prefs.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Sets the context's supported signature verification algorithms.
     ///
     /// This corresponds to [`SSL_CTX_set_verify_algorithm_prefs`]
@@ -1900,6 +1983,77 @@ impl SslContextBuilder {
     #[cfg(not(feature = "fips"))]
     pub fn set_compliance_policy(&mut self, policy: CompliancePolicy) -> Result<(), ErrorStack> {
         unsafe { cvt_0i(ffi::SSL_CTX_set_compliance_policy(self.as_ptr(), policy.0)).map(|_| ()) }
+    }
+
+    /// Sets the list of supported curves to an exclusive set that achieves FIPS compliance.
+    ///
+    /// Corresponds to [`SSL_CTX_set_compliance_policy()`] in more recent versions of boringssl
+    /// which contain that API.
+    ///
+    /// The key difference between this function and the aforementioned API is that compliance
+    /// policy  is that this function sets the minimum and maximum protocol versions to TLS 1.2,
+    /// whereas the aforementioned API sets the minimum to TLS 1.2 and the maximum to TLS 1.3.
+    ///
+    /// See [`SSL_CTX_set_compliance_policy()`] and [`fips202205::Configure`] for comparison.
+    ///
+    /// [`SSL_CTX_set_compliance_policy()`]: https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3385-L3395
+    /// [`fips202205::Configure`]: https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3300-L3321
+    #[cfg(any(feature = "fips", feature = "fips-link-precompiled"))]
+    pub fn set_fips_compliance_policy(&mut self) -> Result<(), ErrorStack> {
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3304-L3310
+        //
+        // We force TLS 1.2 because the [mechanism] for constraining TLS 1.3 used by `SSL_CTX_set_compliance_policy`
+        // is not available in the certified version of BoringSSL. There may yet be a way to do this in the version
+        // we're using, but it's not readily apparent.
+        //
+        // [mechanism]: https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3301
+        self.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        self.set_max_proto_version(Some(SslVersion::TLS1_2))?;
+
+        // There's no corresponding piece of `SSL_CTX_set_compliance_policy` for this, but it's used as
+        // further insurance that only TLS 1.2 is used.
+        let mut opts = self.options();
+        opts |= SslOptions::NO_SSLV2
+            | SslOptions::NO_SSLV3
+            | SslOptions::NO_TLSV1
+            | SslOptions::NO_TLSV1_1
+            | SslOptions::NO_TLSV1_3;
+        self.set_options(opts);
+
+        //https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3311-L3315
+        self.set_strict_cipher_list(
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:\
+            TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:\
+            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:\
+            TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        )?;
+
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3316
+        //
+        // We use `SSL_CTX_set1_curves` rather than `SSL_CTX_set1_group_ids` because the latter
+        // function is not available in the certified version of BoringSSL.
+        self.set_curves(&[SslCurve::SECP256R1, SslCurve::SECP384R1])?;
+
+        let k_sig_algs = &[
+            SslSignatureAlgorithm::RSA_PKCS1_SHA256,
+            SslSignatureAlgorithm::RSA_PKCS1_SHA384,
+            SslSignatureAlgorithm::RSA_PKCS1_SHA512,
+            SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256,
+            SslSignatureAlgorithm::ECDSA_SECP384R1_SHA384,
+            SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256,
+            SslSignatureAlgorithm::RSA_PSS_RSAE_SHA384,
+            SslSignatureAlgorithm::RSA_PSS_RSAE_SHA512,
+        ];
+
+        let k_sig_algs_u16: Vec<u16> = k_sig_algs.iter().map(|alg| alg.0).collect();
+
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3317-L3318
+        self.set_signing_algorithm_prefs(&k_sig_algs_u16)?;
+
+        // https://github.com/google/boringssl/blob/6ab7c1482bf4cdc91c87bc512aaf68ffb18975ec/ssl/ssl_lib.cc#L3319-L3320
+        self.set_verify_algorithm_prefs(k_sig_algs)?;
+
+        Ok(())
     }
 
     /// Consumes the builder, returning a new `SslContext`.
@@ -2240,6 +2394,16 @@ impl ClientHello<'_> {
     /// Returns a string describing the protocol version of the connection.
     pub fn version_str(&self) -> &'static str {
         self.ssl().version_str()
+    }
+
+    /// Returns the raw data of the client hello message
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.0.client_hello, self.0.client_hello_len) }
+    }
+
+    /// Returns the client random data
+    pub fn random(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.0.random, self.0.random_len) }
     }
 }
 
@@ -2746,6 +2910,19 @@ impl SslRef {
     fn server_set_default_curves_list(&mut self) {
         self.set_curves_list("X25519Kyber768Draft00:P256Kyber768Draft00:X25519:P-256:P-384")
             .expect("invalid default server curves list");
+    }
+
+    /// Returns the [`SslCurve`] used for this `SslRef`.
+    ///
+    /// This corresponds to [`SSL_get_curve_id`]
+    ///
+    /// [`SSL_get_curve_id`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_get_curve_id
+    pub fn curve(&self) -> Option<SslCurve> {
+        let curve_id = unsafe { ffi::SSL_get_curve_id(self.as_ptr()) };
+        if curve_id == 0 {
+            return None;
+        }
+        Some(SslCurve(curve_id.into()))
     }
 
     /// Returns an `ErrorCode` value for the most recent operation on this `SslRef`.
@@ -3563,6 +3740,18 @@ impl SslRef {
 
         Ok(())
     }
+
+    /// Sets the private key.
+    ///
+    /// This corresponds to [`SSL_use_PrivateKey`].
+    ///
+    /// [`SSL_use_PrivateKey`]: https://www.openssl.org/docs/man1.1.1/man3/SSL_use_PrivateKey.html
+    pub fn set_private_key<T>(&mut self, key: &PKeyRef<T>) -> Result<(), ErrorStack>
+    where
+        T: HasPrivate,
+    {
+        unsafe { cvt(ffi::SSL_use_PrivateKey(self.as_ptr(), key.as_ptr())).map(|_| ()) }
+    }
 }
 
 /// An SSL stream midway through the handshake process.
@@ -3696,6 +3885,30 @@ impl<S: Read + Write> SslStream<S> {
         Self::new_base(ssl, stream)
     }
 
+    /// Like `read`, but takes a possibly-uninitialized slice.
+    ///
+    /// # Safety
+    ///
+    /// No portion of `buf` will be de-initialized by this method. If the method returns `Ok(n)`,
+    /// then the first `n` bytes of `buf` are guaranteed to be initialized.
+    pub fn read_uninit(&mut self, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
+        loop {
+            match self.ssl_read_uninit(buf) {
+                Ok(n) => return Ok(n),
+                Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => return Ok(0),
+                Err(ref e) if e.code() == ErrorCode::SYSCALL && e.io_error().is_none() => {
+                    return Ok(0);
+                }
+                Err(ref e) if e.code() == ErrorCode::WANT_READ && e.io_error().is_none() => {}
+                Err(e) => {
+                    return Err(e
+                        .into_io_error()
+                        .unwrap_or_else(|e| io::Error::new(io::ErrorKind::Other, e)));
+                }
+            }
+        }
+    }
+
     /// Like `read`, but returns an `ssl::Error` rather than an `io::Error`.
     ///
     /// It is particularly useful with a nonblocking socket, where the error value will identify if
@@ -3705,16 +3918,28 @@ impl<S: Read + Write> SslStream<S> {
     ///
     /// [`SSL_read`]: https://www.openssl.org/docs/manmaster/man3/SSL_read.html
     pub fn ssl_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        // The interpretation of the return code here is a little odd with a
-        // zero-length write. OpenSSL will likely correctly report back to us
-        // that it read zero bytes, but zero is also the sentinel for "error".
-        // To avoid that confusion short-circuit that logic and return quickly
-        // if `buf` has a length of zero.
+        // SAFETY: `ssl_read_uninit` does not de-initialize the buffer.
+        unsafe {
+            self.ssl_read_uninit(slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                buf.len(),
+            ))
+        }
+    }
+
+    /// Like `read_ssl`, but takes a possibly-uninitialized slice.
+    ///
+    /// # Safety
+    ///
+    /// No portion of `buf` will be de-initialized by this method. If the method returns `Ok(n)`,
+    /// then the first `n` bytes of `buf` are guaranteed to be initialized.
+    pub fn ssl_read_uninit(&mut self, buf: &mut [MaybeUninit<u8>]) -> Result<usize, Error> {
         if buf.is_empty() {
             return Ok(0);
         }
 
-        let ret = self.ssl.read(buf);
+        let len = usize::min(c_int::max_value() as usize, buf.len()) as c_int;
+        let ret = unsafe { ffi::SSL_read(self.ssl().as_ptr(), buf.as_mut_ptr().cast(), len) };
         if ret > 0 {
             Ok(ret as usize)
         } else {
@@ -3731,12 +3956,12 @@ impl<S: Read + Write> SslStream<S> {
     ///
     /// [`SSL_write`]: https://www.openssl.org/docs/manmaster/man3/SSL_write.html
     pub fn ssl_write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        // See above for why we short-circuit on zero-length buffers
         if buf.is_empty() {
             return Ok(0);
         }
 
-        let ret = self.ssl.write(buf);
+        let len = usize::min(c_int::max_value() as usize, buf.len()) as c_int;
+        let ret = unsafe { ffi::SSL_write(self.ssl().as_ptr(), buf.as_ptr().cast(), len) };
         if ret > 0 {
             Ok(ret as usize)
         } else {
@@ -3907,20 +4132,12 @@ impl<S> SslStream<S> {
 
 impl<S: Read + Write> Read for SslStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.ssl_read(buf) {
-                Ok(n) => return Ok(n),
-                Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => return Ok(0),
-                Err(ref e) if e.code() == ErrorCode::SYSCALL && e.io_error().is_none() => {
-                    return Ok(0);
-                }
-                Err(ref e) if e.code() == ErrorCode::WANT_READ && e.io_error().is_none() => {}
-                Err(e) => {
-                    return Err(e
-                        .into_io_error()
-                        .unwrap_or_else(|e| io::Error::new(io::ErrorKind::Other, e)));
-                }
-            }
+        // SAFETY: `read_uninit` does not de-initialize the buffer
+        unsafe {
+            self.read_uninit(slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                buf.len(),
+            ))
         }
     }
 }
